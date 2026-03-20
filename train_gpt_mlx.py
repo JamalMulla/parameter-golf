@@ -93,6 +93,7 @@ class Hyperparameters:
     muon_momentum_warmup_start: float = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps: int = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    svd_rank_fraction: float = float(os.environ.get("SVD_RANK_FRACTION", "0.5"))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
 
@@ -666,6 +667,102 @@ def dequantize_state_dict_int8(quant_obj: dict[str, object]) -> dict[str, mx.arr
     return out
 
 
+def quantize_svd_adaptive_mlx(flat_state: dict[str, mx.array], rank_fraction: float):
+    """SVD adaptive quantization for MLX. Falls back to int8 per tensor when SVD is not smaller."""
+    svd: dict[str, dict] = {}
+    int8_quantized: dict[str, np.ndarray] = {}
+    int8_scales: dict[str, np.ndarray] = {}
+    int8_dtypes: dict[str, str] = {}
+    passthrough: dict[str, np.ndarray] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors",
+         "baseline_tensor_bytes", "svd_payload_bytes"),
+        0,
+    )
+    for name, arr in flat_state.items():
+        stats["param_count"] += int(arr.size)
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += int(arr.nbytes)
+        if not mx.issubdtype(arr.dtype, mx.floating):
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = np.ascontiguousarray(np.array(arr))
+            stats["svd_payload_bytes"] += int(passthrough[name].nbytes)
+            continue
+        if int(arr.size) <= INT8_KEEP_FLOAT_MAX_NUMEL or arr.ndim != 2:
+            kept = keep_float_array(name, arr, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["svd_payload_bytes"] += int(kept.nbytes)
+            continue
+        stats["num_float_tensors"] += 1
+        f32 = _np_float32(arr)
+        m, n = f32.shape
+        k = max(1, round(min(m, n) * rank_fraction))
+        svd_bytes = k * (m + n) + k * 6
+        int8_bytes = m * n + 2 * m
+        if svd_bytes >= int8_bytes:
+            q, s = quantize_float_array(arr)
+            int8_quantized[name] = q
+            int8_scales[name] = s
+            int8_dtypes[name] = str(arr.dtype).split(".")[-1]
+            stats["svd_payload_bytes"] += int(q.nbytes + s.nbytes)
+            continue
+        U, S, Vh = np.linalg.svd(f32, full_matrices=False)
+        U_k = np.ascontiguousarray(U[:, :k])
+        S_k = np.ascontiguousarray(S[:k])
+        Vh_k = np.ascontiguousarray(Vh[:k, :])
+        U_scales = np.maximum(np.abs(U_k).max(axis=0), 1e-8) / 127.0
+        U_q = np.clip(np.round(U_k / U_scales[None, :]), -127, 127).astype(np.int8)
+        Vh_scales = np.maximum(np.abs(Vh_k).max(axis=1), 1e-8) / 127.0
+        Vh_q = np.clip(np.round(Vh_k / Vh_scales[:, None]), -127, 127).astype(np.int8)
+        svd[name] = {
+            "U_q": U_q, "U_scales": U_scales.astype(np.float16),
+            "S": S_k.astype(np.float16),
+            "Vh_q": Vh_q, "Vh_scales": Vh_scales.astype(np.float16),
+            "dtype": str(arr.dtype).split(".")[-1],
+        }
+        stats["svd_payload_bytes"] += (
+            U_q.nbytes + U_scales.astype(np.float16).nbytes
+            + S_k.astype(np.float16).nbytes
+            + Vh_q.nbytes + Vh_scales.astype(np.float16).nbytes
+        )
+    obj: dict[str, object] = {
+        "__quant_format__": "svd_adaptive_v1",
+        "svd": svd,
+        "int8_quantized": int8_quantized, "int8_scales": int8_scales, "int8_dtypes": int8_dtypes,
+        "passthrough": passthrough,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_svd_adaptive_mlx(obj: dict[str, object]) -> dict[str, mx.array]:
+    out: dict[str, mx.array] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, d in obj["svd"].items():
+        dtype = MX_DTYPE_FROM_NAME[d["dtype"]]
+        U = d["U_q"].astype(np.float32) * d["U_scales"].astype(np.float32)[None, :]
+        S = d["S"].astype(np.float32)
+        Vh = d["Vh_q"].astype(np.float32) * d["Vh_scales"].astype(np.float32)[:, None]
+        W = (U * S[None, :]) @ Vh
+        out[name] = mx.array(W, dtype=dtype)
+    for name, q in obj["int8_quantized"].items():
+        dtype = MX_DTYPE_FROM_NAME[obj["int8_dtypes"][name]]
+        s = np.asarray(obj["int8_scales"][name], dtype=np.float32)
+        if s.ndim > 0:
+            out_arr = q.astype(np.float32) * s.reshape((q.shape[0],) + (1,) * (q.ndim - 1))
+        else:
+            out_arr = q.astype(np.float32) * float(s)
+        out[name] = mx.array(out_arr, dtype=dtype)
+    for name, arr in obj["passthrough"].items():
+        out_arr = np.array(arr, copy=True)
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out[name] = mx.array(out_arr, dtype=MX_DTYPE_FROM_NAME[orig_dtype])
+        else:
+            out[name] = mx.array(out_arr)
+    return out
+
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1067,7 +1164,7 @@ def main() -> None:
     mx.savez(str(out_path), **flat_state)
     log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+    quant_obj, quant_stats = quantize_svd_adaptive_mlx(flat_state, args.svd_rank_fraction)
     quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_serialized_bytes = len(quant_raw)
@@ -1075,15 +1172,15 @@ def main() -> None:
     with quant_path.open("wb") as f:
         f.write(quant_blob)
     quant_file_bytes = quant_path.stat().st_size
-    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["svd_payload_bytes"], 1)
     log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        f"serialized_model_svd_zlib (rank_fraction={args.svd_rank_fraction}):{quant_file_bytes} bytes "
+        f"(payload:{quant_stats['svd_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
     )
 
     with quant_path.open("rb") as f:
         quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+    quant_flat = dequantize_svd_adaptive_mlx(pickle.loads(zlib.decompress(quant_blob_disk)))
     model.update(tree_unflatten(list(quant_flat.items())))
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(

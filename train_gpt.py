@@ -86,6 +86,9 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # SVD adaptive quantization: fraction of singular values to keep (1.0 = int8 equivalent quality).
+    svd_rank_fraction = float(os.environ.get("SVD_RANK_FRACTION", "0.5"))
+
     # Test-time training (LoRA) hyperparameters.
     ttt_lora_rank = int(os.environ.get("TTT_LORA_RANK", 8))
     ttt_lora_lr = float(os.environ.get("TTT_LORA_LR", 0.01))
@@ -429,8 +432,121 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def quantize_svd_adaptive(state_dict: dict[str, Tensor], rank_fraction: float):
+    """
+    SVD-based adaptive quantization. Analogous to JPEG: high singular values (important
+    directions) get int8 precision; low singular values are dropped entirely.
+    For each large 2D weight matrix, computes W = U @ diag(S) @ Vh and keeps only the
+    top-k components (k = max(1, round(min(m,n) * rank_fraction)).
+    Per-tensor, automatically falls back to standard int8 if SVD would cost more bytes.
+    Small and non-2D tensors use the existing fp16 passthrough path.
+    """
+    svd: dict[str, dict] = {}
+    int8_quantized: dict[str, Tensor] = {}
+    int8_scales: dict[str, Tensor] = {}
+    int8_dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors",
+         "baseline_tensor_bytes", "svd_payload_bytes"),
+        0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["svd_payload_bytes"] += tensor_nbytes(t)
+            continue
+        if t.ndim != 2 or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["svd_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        stats["num_float_tensors"] += 1
+        t32 = t.float()
+        m, n = t32.shape
+        k = max(1, round(min(m, n) * rank_fraction))
+        # Compare costs before doing expensive SVD: int8 costs m*n + 2*m bytes,
+        # SVD costs k*(m+n) + 6*k bytes (U_q, Vh_q int8 + 3 fp16 scale/S arrays of size k).
+        svd_bytes = k * (m + n) + k * 6
+        int8_bytes = m * n + 2 * m
+        if svd_bytes >= int8_bytes:
+            # SVD offers no size advantage for this tensor; use standard int8.
+            q, s = quantize_float_tensor(t)
+            int8_quantized[name] = q
+            int8_scales[name] = s
+            int8_dtypes[name] = str(tensor.dtype).removeprefix("torch.")
+            stats["svd_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+            continue
+        U, S, Vh = torch.linalg.svd(t32, full_matrices=False)  # U:[m,r] S:[r] Vh:[r,n]
+        U_k = U[:, :k].contiguous()
+        S_k = S[:k].contiguous()
+        Vh_k = Vh[:k, :].contiguous()
+        # Per-column quantization for U (each column is a unit vector).
+        U_scales = U_k.abs().amax(dim=0).clamp_min_(1e-8).div_(127.0)
+        U_q = U_k.div(U_scales[None, :]).round_().clamp_(-127, 127).to(torch.int8)
+        # Per-row quantization for Vh (each row is a unit vector).
+        Vh_scales = Vh_k.abs().amax(dim=1).clamp_min_(1e-8).div_(127.0)
+        Vh_q = Vh_k.div(Vh_scales[:, None]).round_().clamp_(-127, 127).to(torch.int8)
+        svd[name] = {
+            "U_q": U_q, "U_scales": U_scales.to(torch.float16),
+            "S": S_k.to(torch.float16),
+            "Vh_q": Vh_q, "Vh_scales": Vh_scales.to(torch.float16),
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+        }
+        stats["svd_payload_bytes"] += (
+            tensor_nbytes(U_q) + tensor_nbytes(U_scales.to(torch.float16))
+            + tensor_nbytes(S_k.to(torch.float16))
+            + tensor_nbytes(Vh_q) + tensor_nbytes(Vh_scales.to(torch.float16))
+        )
+    obj: dict[str, object] = {
+        "__quant_format__": "svd_adaptive_v1",
+        "svd": svd,
+        "int8_quantized": int8_quantized, "int8_scales": int8_scales, "int8_dtypes": int8_dtypes,
+        "passthrough": passthrough,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+def dequantize_svd_adaptive(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    for name, d in obj["svd"].items():
+        dtype = getattr(torch, d["dtype"])
+        U = d["U_q"].float() * d["U_scales"].float()[None, :]    # [m, k]
+        S = d["S"].float()                                         # [k]
+        Vh = d["Vh_q"].float() * d["Vh_scales"].float()[:, None]  # [k, n]
+        out[name] = ((U * S[None, :]) @ Vh).to(dtype=dtype).contiguous()
+    for name, q in obj["int8_quantized"].items():
+        dtype = getattr(torch, obj["int8_dtypes"][name])
+        s = obj["int8_scales"][name]
+        if s.ndim > 0:
+            out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
+    fmt = obj.get("__quant_format__", "int8_clean_per_row_v1")
+    if fmt == "svd_adaptive_v1":
+        return dequantize_svd_adaptive(obj)
+    return dequantize_state_dict_int8(obj)
+
+
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -1305,7 +1421,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_svd_adaptive(base_model.state_dict(), args.svd_rank_fraction)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1316,19 +1432,19 @@ def main() -> None:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["svd_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model svd+zlib (rank_fraction={args.svd_rank_fraction}): {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['svd_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size svd+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+    base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
